@@ -133,6 +133,16 @@ class ChatModelTests(BaseStandardTests):
         )
 
     @property
+    def structured_output_kwargs(self) -> dict:
+        """If specified, additional kwargs for with_structured_output."""
+        return {}
+
+    @property
+    def supports_json_mode(self) -> bool:
+        """(bool) whether the chat model supports JSON mode."""
+        return False
+
+    @property
     def supports_image_inputs(self) -> bool:
         """(bool) whether the chat model supports image inputs, defaults to
         ``False``."""
@@ -281,7 +291,7 @@ class ChatModelUnitTests(ChatModelTests):
         output.
 
         By default, this is determined by whether the chat model's
-        `with_structured_output` method is overridden. If the base implementation is
+        ``with_structured_output`` method is overridden. If the base implementation is
         intended to be used, this method should be overridden.
 
         See: https://python.langchain.com/docs/concepts/structured_outputs/
@@ -292,6 +302,34 @@ class ChatModelUnitTests(ChatModelTests):
 
             @property
             def has_structured_output(self) -> bool:
+                return True
+
+    .. dropdown:: structured_output_kwargs
+
+        Dict property that can be used to specify additional kwargs for
+        ``with_structured_output``. Useful for testing different models.
+
+        Example:
+
+        .. code-block:: python
+
+            @property
+            def structured_output_kwargs(self) -> dict:
+                return {"method": "function_calling"}
+
+    .. dropdown:: supports_json_mode
+
+        Boolean property indicating whether the chat model supports JSON mode in
+        ``with_structured_output``.
+
+        See: https://python.langchain.com/docs/concepts/structured_outputs/#json-mode
+
+        Example:
+
+        .. code-block:: python
+
+            @property
+            def supports_json_mode(self) -> bool:
                 return True
 
     .. dropdown:: supports_image_inputs
