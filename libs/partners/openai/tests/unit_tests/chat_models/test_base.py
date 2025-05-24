@@ -21,6 +21,8 @@ from langchain_core.messages import (
 from langchain_core.messages.ai import UsageMetadata
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda
+from langchain_core.tracers.base import BaseTracer
+from langchain_core.tracers.schemas import Run
 from openai.types.responses import ResponseOutputMessage
 from openai.types.responses.response import IncompleteDetails, Response, ResponseUsage
 from openai.types.responses.response_error import ResponseError
@@ -614,6 +616,50 @@ def test_openai_invoke_name(mock_client: MagicMock) -> None:
         assert res.name == "Erick"
 
 
+def test_function_calls_with_tool_calls(mock_client: MagicMock) -> None:
+    # Test that we ignore function calls if tool_calls are present
+    llm = ChatOpenAI(model="gpt-4.1-mini")
+    tool_call_message = AIMessage(
+        content="",
+        additional_kwargs={
+            "function_call": {
+                "name": "get_weather",
+                "arguments": '{"location": "Boston"}',
+            }
+        },
+        tool_calls=[
+            {
+                "name": "get_weather",
+                "args": {"location": "Boston"},
+                "id": "abc123",
+                "type": "tool_call",
+            }
+        ],
+    )
+    messages = [
+        HumanMessage("What's the weather in Boston?"),
+        tool_call_message,
+        ToolMessage(content="It's sunny.", name="get_weather", tool_call_id="abc123"),
+    ]
+    with patch.object(llm, "client", mock_client):
+        _ = llm.invoke(messages)
+        _, call_kwargs = mock_client.create.call_args
+        call_messages = call_kwargs["messages"]
+        tool_call_message_payload = call_messages[1]
+        assert "tool_calls" in tool_call_message_payload
+        assert "function_call" not in tool_call_message_payload
+
+    # Test we don't ignore function calls if tool_calls are not present
+    cast(AIMessage, messages[1]).tool_calls = []
+    with patch.object(llm, "client", mock_client):
+        _ = llm.invoke(messages)
+        _, call_kwargs = mock_client.create.call_args
+        call_messages = call_kwargs["messages"]
+        tool_call_message_payload = call_messages[1]
+        assert "function_call" in tool_call_message_payload
+        assert "tool_calls" not in tool_call_message_payload
+
+
 def test_custom_token_counting() -> None:
     def token_encoder(text: str) -> list[int]:
         return [1, 2, 3]
@@ -956,13 +1002,17 @@ def test__get_request_payload() -> None:
     messages: list = [
         SystemMessage("hello"),
         SystemMessage("bye", additional_kwargs={"__openai_role__": "developer"}),
+        SystemMessage(content=[{"type": "text", "text": "hello!"}]),
         {"role": "human", "content": "how are you"},
+        {"role": "user", "content": [{"type": "text", "text": "feeling today"}]},
     ]
     expected = {
         "messages": [
             {"role": "system", "content": "hello"},
             {"role": "developer", "content": "bye"},
+            {"role": "system", "content": [{"type": "text", "text": "hello!"}]},
             {"role": "user", "content": "how are you"},
+            {"role": "user", "content": [{"type": "text", "text": "feeling today"}]},
         ],
         "model": "gpt-4o-2024-08-06",
         "stream": False,
@@ -977,11 +1027,47 @@ def test__get_request_payload() -> None:
         "messages": [
             {"role": "developer", "content": "hello"},
             {"role": "developer", "content": "bye"},
+            {"role": "developer", "content": [{"type": "text", "text": "hello!"}]},
             {"role": "user", "content": "how are you"},
+            {"role": "user", "content": [{"type": "text", "text": "feeling today"}]},
         ],
         "model": "o3-mini",
         "stream": False,
     }
+    assert payload == expected
+
+    # Test we ignore reasoning blocks from other providers
+    reasoning_messages: list = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "reasoning_content", "reasoning_content": "reasoning..."},
+                {"type": "text", "text": "reasoned response"},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "thinking", "thinking": "thinking..."},
+                {"type": "text", "text": "thoughtful response"},
+            ],
+        },
+    ]
+    expected = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "reasoned response"}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "thoughtful response"}],
+            },
+        ],
+        "model": "o3-mini",
+        "stream": False,
+    }
+    payload = llm._get_request_payload(reasoning_messages)
     assert payload == expected
 
 
@@ -1658,6 +1744,9 @@ def test__construct_responses_api_input_multiple_message_types() -> None:
     """Test conversion of a conversation with multiple message types."""
     messages = [
         SystemMessage(content="You are a helpful assistant."),
+        SystemMessage(
+            content=[{"type": "text", "text": "You are a very helpful assistant!"}]
+        ),
         HumanMessage(content="What's the weather in San Francisco?"),
         HumanMessage(
             content=[{"type": "text", "text": "What's the weather in San Francisco?"}]
@@ -1698,31 +1787,36 @@ def test__construct_responses_api_input_multiple_message_types() -> None:
     assert result[0]["role"] == "system"
     assert result[0]["content"] == "You are a helpful assistant."
 
+    assert result[1]["role"] == "system"
+    assert result[1]["content"] == [
+        {"type": "input_text", "text": "You are a very helpful assistant!"}
+    ]
+
     # Check human message
-    assert result[1]["role"] == "user"
-    assert result[1]["content"] == "What's the weather in San Francisco?"
     assert result[2]["role"] == "user"
-    assert result[2]["content"] == [
+    assert result[2]["content"] == "What's the weather in San Francisco?"
+    assert result[3]["role"] == "user"
+    assert result[3]["content"] == [
         {"type": "input_text", "text": "What's the weather in San Francisco?"}
     ]
 
     # Check function call
-    assert result[3]["type"] == "function_call"
-    assert result[3]["name"] == "get_weather"
-    assert result[3]["arguments"] == '{"location": "San Francisco"}'
-    assert result[3]["call_id"] == "call_123"
-    assert result[3]["id"] == "func_456"
+    assert result[4]["type"] == "function_call"
+    assert result[4]["name"] == "get_weather"
+    assert result[4]["arguments"] == '{"location": "San Francisco"}'
+    assert result[4]["call_id"] == "call_123"
+    assert result[4]["id"] == "func_456"
 
     # Check function call output
-    assert result[4]["type"] == "function_call_output"
-    assert result[4]["output"] == '{"temperature": 72, "conditions": "sunny"}'
-    assert result[4]["call_id"] == "call_123"
-
-    assert result[5]["role"] == "assistant"
-    assert result[5]["content"] == "The weather in San Francisco is 72°F and sunny."
+    assert result[5]["type"] == "function_call_output"
+    assert result[5]["output"] == '{"temperature": 72, "conditions": "sunny"}'
+    assert result[5]["call_id"] == "call_123"
 
     assert result[6]["role"] == "assistant"
-    assert result[6]["content"] == [
+    assert result[6]["content"] == "The weather in San Francisco is 72°F and sunny."
+
+    assert result[7]["role"] == "assistant"
+    assert result[7]["content"] == [
         {
             "type": "output_text",
             "text": "The weather in San Francisco is 72°F and sunny.",
@@ -1733,8 +1827,101 @@ def test__construct_responses_api_input_multiple_message_types() -> None:
     # assert no mutation has occurred
     assert messages_copy == messages
 
+    # Test dict messages
+    llm = ChatOpenAI(model="o4-mini", use_responses_api=True)
+    message_dicts: list = [
+        {"role": "developer", "content": "This is a developer message."},
+        {
+            "role": "developer",
+            "content": [{"type": "text", "text": "This is a developer message!"}],
+        },
+    ]
+    payload = llm._get_request_payload(message_dicts)
+    result = payload["input"]
+    assert len(result) == 2
+    assert result[0]["role"] == "developer"
+    assert result[0]["content"] == "This is a developer message."
+    assert result[1]["role"] == "developer"
+    assert result[1]["content"] == [
+        {"type": "input_text", "text": "This is a developer message!"}
+    ]
+
 
 def test_service_tier() -> None:
     llm = ChatOpenAI(model="o4-mini", service_tier="flex")
     payload = llm._get_request_payload([HumanMessage("Hello")])
     assert payload["service_tier"] == "flex"
+
+
+class FakeTracer(BaseTracer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.chat_model_start_inputs: list = []
+
+    def _persist_run(self, run: Run) -> None:
+        """Persist a run."""
+        pass
+
+    def on_chat_model_start(self, *args: Any, **kwargs: Any) -> Run:
+        self.chat_model_start_inputs.append({"args": args, "kwargs": kwargs})
+        return super().on_chat_model_start(*args, **kwargs)
+
+
+def test_mcp_tracing() -> None:
+    # Test we exclude sensitive information from traces
+    llm = ChatOpenAI(model="o4-mini", use_responses_api=True)
+
+    tracer = FakeTracer()
+    mock_client = MagicMock()
+
+    def mock_create(*args: Any, **kwargs: Any) -> Response:
+        return Response(
+            id="resp_123",
+            created_at=1234567890,
+            model="o4-mini",
+            object="response",
+            parallel_tool_calls=True,
+            tools=[],
+            tool_choice="auto",
+            output=[
+                ResponseOutputMessage(
+                    type="message",
+                    id="msg_123",
+                    content=[
+                        ResponseOutputText(
+                            type="output_text", text="Test response", annotations=[]
+                        )
+                    ],
+                    role="assistant",
+                    status="completed",
+                )
+            ],
+        )
+
+    mock_client.responses.create = mock_create
+    input_message = HumanMessage("Test query")
+    tools = [
+        {
+            "type": "mcp",
+            "server_label": "deepwiki",
+            "server_url": "https://mcp.deepwiki.com/mcp",
+            "require_approval": "always",
+            "headers": {"Authorization": "Bearer PLACEHOLDER"},
+        }
+    ]
+    with patch.object(llm, "root_client", mock_client):
+        llm_with_tools = llm.bind_tools(tools)
+        _ = llm_with_tools.invoke([input_message], config={"callbacks": [tracer]})
+
+    # Test headers are not traced
+    assert len(tracer.chat_model_start_inputs) == 1
+    invocation_params = tracer.chat_model_start_inputs[0]["kwargs"]["invocation_params"]
+    for tool in invocation_params["tools"]:
+        if "headers" in tool:
+            assert tool["headers"] == "**REDACTED**"
+    for substring in ["Authorization", "Bearer", "PLACEHOLDER"]:
+        assert substring not in str(tracer.chat_model_start_inputs)
+
+    # Test headers are correctly propagated to request
+    payload = llm_with_tools._get_request_payload([input_message], tools=tools)  # type: ignore[attr-defined]
+    assert payload["tools"][0]["headers"]["Authorization"] == "Bearer PLACEHOLDER"

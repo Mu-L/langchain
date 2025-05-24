@@ -195,7 +195,7 @@ def _format_message_content(content: Any) -> Any:
             if (
                 isinstance(block, dict)
                 and "type" in block
-                and block["type"] in ("tool_use", "thinking")
+                and block["type"] in ("tool_use", "thinking", "reasoning_content")
             ):
                 continue
             elif isinstance(block, dict) and is_data_content_block(block):
@@ -251,8 +251,6 @@ def _convert_message_to_dict(message: BaseMessage) -> dict:
         message_dict["role"] = "user"
     elif isinstance(message, AIMessage):
         message_dict["role"] = "assistant"
-        if "function_call" in message.additional_kwargs:
-            message_dict["function_call"] = message.additional_kwargs["function_call"]
         if message.tool_calls or message.invalid_tool_calls:
             message_dict["tool_calls"] = [
                 _lc_tool_call_to_openai_tool_call(tc) for tc in message.tool_calls
@@ -267,6 +265,10 @@ def _convert_message_to_dict(message: BaseMessage) -> dict:
                 {k: v for k, v in tool_call.items() if k in tool_call_supported_props}
                 for tool_call in message_dict["tool_calls"]
             ]
+        elif "function_call" in message.additional_kwargs:
+            # OpenAI raises 400 if both function_call and tool_calls are present in the
+            # same message.
+            message_dict["function_call"] = message.additional_kwargs["function_call"]
         else:
             pass
         # If tool calls present, content null value should be None not empty string.
@@ -736,6 +738,8 @@ class BaseChatOpenAI(BaseChatModel):
                 generation_info["model_name"] = model_name
             if system_fingerprint := chunk.get("system_fingerprint"):
                 generation_info["system_fingerprint"] = system_fingerprint
+            if service_tier := chunk.get("service_tier"):
+                generation_info["service_tier"] = service_tier
 
         logprobs = choice.get("logprobs")
         if logprobs:
@@ -771,16 +775,22 @@ class BaseChatOpenAI(BaseChatModel):
 
         with context_manager as response:
             is_first_chunk = True
+            has_reasoning = False
             for chunk in response:
                 metadata = headers if is_first_chunk else {}
                 if generation_chunk := _convert_responses_chunk_to_generation_chunk(
-                    chunk, schema=original_schema_obj, metadata=metadata
+                    chunk,
+                    schema=original_schema_obj,
+                    metadata=metadata,
+                    has_reasoning=has_reasoning,
                 ):
                     if run_manager:
                         run_manager.on_llm_new_token(
                             generation_chunk.text, chunk=generation_chunk
                         )
                     is_first_chunk = False
+                    if "reasoning" in generation_chunk.message.additional_kwargs:
+                        has_reasoning = True
                     yield generation_chunk
 
     async def _astream_responses(
@@ -807,16 +817,22 @@ class BaseChatOpenAI(BaseChatModel):
 
         async with context_manager as response:
             is_first_chunk = True
+            has_reasoning = False
             async for chunk in response:
                 metadata = headers if is_first_chunk else {}
                 if generation_chunk := _convert_responses_chunk_to_generation_chunk(
-                    chunk, schema=original_schema_obj, metadata=metadata
+                    chunk,
+                    schema=original_schema_obj,
+                    metadata=metadata,
+                    has_reasoning=has_reasoning,
                 ):
                     if run_manager:
                         await run_manager.on_llm_new_token(
                             generation_chunk.text, chunk=generation_chunk
                         )
                     is_first_chunk = False
+                    if "reasoning" in generation_chunk.message.additional_kwargs:
+                        has_reasoning = True
                     yield generation_chunk
 
     def _should_stream_usage(
@@ -1020,6 +1036,8 @@ class BaseChatOpenAI(BaseChatModel):
         }
         if "id" in response_dict:
             llm_output["id"] = response_dict["id"]
+        if "service_tier" in response_dict:
+            llm_output["service_tier"] = response_dict["service_tier"]
 
         if isinstance(response, openai.BaseModel) and getattr(
             response, "choices", None
@@ -1170,12 +1188,22 @@ class BaseChatOpenAI(BaseChatModel):
         self, stop: Optional[list[str]] = None, **kwargs: Any
     ) -> dict[str, Any]:
         """Get the parameters used to invoke the model."""
-        return {
+        params = {
             "model": self.model_name,
             **super()._get_invocation_params(stop=stop),
             **self._default_params,
             **kwargs,
         }
+        # Redact headers from built-in remote MCP tool invocations
+        if (tools := params.get("tools")) and isinstance(tools, list):
+            params["tools"] = [
+                ({**tool, "headers": "**REDACTED**"} if "headers" in tool else tool)
+                if isinstance(tool, dict) and tool.get("type") == "mcp"
+                else tool
+                for tool in tools
+            ]
+
+        return params
 
     def _get_ls_params(
         self, stop: Optional[list[str]] = None, **kwargs: Any
@@ -1450,6 +1478,8 @@ class BaseChatOpenAI(BaseChatModel):
                     "file_search",
                     "web_search_preview",
                     "computer_use_preview",
+                    "code_interpreter",
+                    "mcp",
                 ):
                     tool_choice = {"type": tool_choice}
                 # 'any' is not natively supported by OpenAI API.
@@ -2920,9 +2950,9 @@ class OpenAIRefusalError(Exception):
 
 
 def _create_usage_metadata(oai_token_usage: dict) -> UsageMetadata:
-    input_tokens = oai_token_usage.get("prompt_tokens", 0)
-    output_tokens = oai_token_usage.get("completion_tokens", 0)
-    total_tokens = oai_token_usage.get("total_tokens", input_tokens + output_tokens)
+    input_tokens = oai_token_usage.get("prompt_tokens") or 0
+    output_tokens = oai_token_usage.get("completion_tokens") or 0
+    total_tokens = oai_token_usage.get("total_tokens") or input_tokens + output_tokens
     input_token_details: dict = {
         "audio": (oai_token_usage.get("prompt_tokens_details") or {}).get(
             "audio_tokens"
@@ -3123,6 +3153,7 @@ def _construct_responses_api_input(messages: Sequence[BaseMessage]) -> list:
             reasoning_items = []
             if reasoning := lc_msg.additional_kwargs.get("reasoning"):
                 reasoning_items.append(_pop_summary_index_from_reasoning(reasoning))
+            input_.extend(reasoning_items)
             # Function calls
             function_calls = []
             if tool_calls := msg.pop("tool_calls", None):
@@ -3143,12 +3174,22 @@ def _construct_responses_api_input(messages: Sequence[BaseMessage]) -> list:
                     ):
                         function_call["id"] = _id
                     function_calls.append(function_call)
-            # Computer calls
+            # Built-in tool calls
             computer_calls = []
+            code_interpreter_calls = []
+            mcp_calls = []
             tool_outputs = lc_msg.additional_kwargs.get("tool_outputs", [])
             for tool_output in tool_outputs:
                 if tool_output.get("type") == "computer_call":
                     computer_calls.append(tool_output)
+                elif tool_output.get("type") == "code_interpreter_call":
+                    code_interpreter_calls.append(tool_output)
+                elif tool_output.get("type") == "mcp_call":
+                    mcp_calls.append(tool_output)
+                else:
+                    pass
+            input_.extend(code_interpreter_calls)
+            input_.extend(mcp_calls)
             msg["content"] = msg.get("content") or []
             if lc_msg.additional_kwargs.get("refusal"):
                 if isinstance(msg["content"], str):
@@ -3181,16 +3222,15 @@ def _construct_responses_api_input(messages: Sequence[BaseMessage]) -> list:
                         pass
                 msg["content"] = new_blocks
             if msg["content"]:
+                if lc_msg.id and lc_msg.id.startswith("msg_"):
+                    msg["id"] = lc_msg.id
                 input_.append(msg)
             input_.extend(function_calls)
-            if computer_calls:
-                # Hack: we only add reasoning items if computer calls are present. See:
-                # https://community.openai.com/t/how-to-solve-badrequesterror-400-item-rs-of-type-reasoning-was-provided-without-its-required-following-item-error-in-responses-api/1151686/5
-                input_.extend(reasoning_items)
-                input_.extend(computer_calls)
-        elif msg["role"] == "user":
+            input_.extend(computer_calls)
+        elif msg["role"] in ("user", "system", "developer"):
             if isinstance(msg["content"], list):
                 new_blocks = []
+                non_message_item_types = ("mcp_approval_response",)
                 for block in msg["content"]:
                     # chat api: {"type": "text", "text": "..."}
                     # responses api: {"type": "input_text", "text": "..."}
@@ -3211,10 +3251,15 @@ def _construct_responses_api_input(messages: Sequence[BaseMessage]) -> list:
                         new_blocks.append(new_block)
                     elif block["type"] in ("input_text", "input_image", "input_file"):
                         new_blocks.append(block)
+                    elif block["type"] in non_message_item_types:
+                        input_.append(block)
                     else:
                         pass
                 msg["content"] = new_blocks
-            input_.append(msg)
+                if msg["content"]:
+                    input_.append(msg)
+            else:
+                input_.append(msg)
         else:
             input_.append(msg)
 
@@ -3243,6 +3288,7 @@ def _construct_lc_result_from_responses_api(
             "status",
             "user",
             "model",
+            "service_tier",
         )
     }
     if metadata:
@@ -3360,7 +3406,10 @@ def _construct_lc_result_from_responses_api(
 
 
 def _convert_responses_chunk_to_generation_chunk(
-    chunk: Any, schema: Optional[type[_BM]] = None, metadata: Optional[dict] = None
+    chunk: Any,
+    schema: Optional[type[_BM]] = None,
+    metadata: Optional[dict] = None,
+    has_reasoning: bool = False,
 ) -> Optional[ChatGenerationChunk]:
     content = []
     tool_call_chunks: list = []
@@ -3423,6 +3472,10 @@ def _convert_responses_chunk_to_generation_chunk(
         "web_search_call",
         "file_search_call",
         "computer_call",
+        "code_interpreter_call",
+        "mcp_call",
+        "mcp_list_tools",
+        "mcp_approval_request",
     ):
         additional_kwargs["tool_outputs"] = [
             chunk.item.model_dump(exclude_none=True, mode="json")
@@ -3438,9 +3491,11 @@ def _convert_responses_chunk_to_generation_chunk(
     elif chunk.type == "response.refusal.done":
         additional_kwargs["refusal"] = chunk.refusal
     elif chunk.type == "response.output_item.added" and chunk.item.type == "reasoning":
-        additional_kwargs["reasoning"] = chunk.item.model_dump(
-            exclude_none=True, mode="json"
-        )
+        if not has_reasoning:
+            # Hack until breaking release: store first reasoning item ID.
+            additional_kwargs["reasoning"] = chunk.item.model_dump(
+                exclude_none=True, mode="json"
+            )
     elif chunk.type == "response.reasoning_summary_part.added":
         additional_kwargs["reasoning"] = {
             # langchain-core uses the `index` key to aggregate text blocks.
